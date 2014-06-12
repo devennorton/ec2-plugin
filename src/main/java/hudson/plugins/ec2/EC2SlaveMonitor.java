@@ -1,11 +1,16 @@
 package hudson.plugins.ec2;
 
+import com.amazonaws.services.ec2.AmazonEC2;
+import com.amazonaws.services.ec2.model.*;
 import hudson.Extension;
 import hudson.model.AsyncPeriodicWork;
 import hudson.model.TaskListener;
 import hudson.model.Node;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -35,20 +40,55 @@ public class EC2SlaveMonitor extends AsyncPeriodicWork {
 
     @Override
     protected void execute(TaskListener listener) throws IOException, InterruptedException {
-        for (Node node : Jenkins.getInstance().getNodes()) {
-            if (node instanceof EC2AbstractSlave) {
-                final EC2AbstractSlave ec2Slave = (EC2AbstractSlave) node;
-                try {
-                    if (!ec2Slave.isAlive(true)) {
-                        LOGGER.info("EC2 instance is dead: " + ec2Slave.getInstanceId());
-                        ec2Slave.terminate();
-                    }
-                } catch (AmazonClientException e) {
-                    LOGGER.info("EC2 instance is dead and failed to terminate: " + ec2Slave.getInstanceId());
-                    removeNode(ec2Slave);
+        AmazonEC2Cloud cloud = (AmazonEC2Cloud)Jenkins.getInstance().getCloud("EC2Cloud");
+        AmazonEC2 ec2 = cloud.connect();
+        List<EC2AbstractSlave> nodes = filterEC2Nodes(Jenkins.getInstance().getNodes());
+        List<String> deathRow = new ArrayList<String>();
+        for (EC2AbstractSlave node : nodes) {
+            try {
+                if (!node.isAlive(true)) {
+                    LOGGER.info("EC2 instance is dead: " + node.getInstanceId());
+                    node.terminate();
                 }
+            } catch (AmazonClientException e) {
+                LOGGER.info("EC2 instance is dead and failed to terminate: " + node.getInstanceId());
+                removeNode(node);
             }
         }
+
+        for(SlaveTemplate template : cloud.getTemplates()){
+            DescribeInstancesRequest describeInstancesRequest = new DescribeInstancesRequest().withFilters(new Filter("image-id", Arrays.asList(template.ami)));
+            DescribeInstancesResult describeInstancesResult = ec2.describeInstances(describeInstancesRequest);
+            for(Reservation reservation : describeInstancesResult.getReservations()) {
+                for(Instance instance : reservation.getInstances()) {
+                    if(!nodesContainInstance(instance.getInstanceId(), nodes)) {
+                        deathRow.add(instance.getInstanceId());
+                    }
+                }
+            }
+
+        }
+
+        TerminateInstancesRequest request = new TerminateInstancesRequest(deathRow);
+        ec2.terminateInstances(request);
+
+    }
+
+    private List<EC2AbstractSlave> filterEC2Nodes(List<Node> nodes) {
+        ArrayList<EC2AbstractSlave> ec2AbstractSlaves = new ArrayList<EC2AbstractSlave>();
+        for(Node node : nodes) {
+            if (node instanceof EC2AbstractSlave) {
+                ec2AbstractSlaves.add((EC2AbstractSlave) node);
+            }
+        }
+        return ec2AbstractSlaves;
+    }
+
+    private boolean nodesContainInstance(String instanceId, List<EC2AbstractSlave> nodes) {
+        for(Node node : nodes) {
+            if(node.getNodeName().contains(instanceId)) return true;
+        }
+        return false;
     }
 
     private void removeNode(EC2AbstractSlave ec2Slave) {
